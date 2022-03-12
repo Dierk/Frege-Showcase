@@ -1,0 +1,93 @@
+
+module fhnw.JavaFxLineChart where
+
+import frege.Prelude hiding (ListView) -- avoid the compiler warning
+import fregefx.JavaFxType
+import fregefx.JavaFxAll
+import fregefx.JavaFxUtils
+
+-- Regression --
+average :: [Double] -> Double
+average [] = error "no average for empty lists"
+average xs = sum xs / fromInt (length xs)
+
+--- true if all values in the list are equal, false otherwise
+allEqual :: Eq a => [a] -> Bool
+allEqual []  = true
+allEqual xs  = foldr (\it acc -> acc && (it == xs!!0) ) true xs
+
+--- take a list of (x,y) coordinates and return (a,b) such that f(x) = a + b * x is the
+--- linear function that minimizes the average squared distance of the data points to f(x)
+linearRegression :: [(Double,Double)] -> (Double,Double)
+linearRegression []  = error "insufficient data for linearRegression: no data points"
+linearRegression [x] = error "insufficient data for linearRegression: only one data point"
+linearRegression xys = let
+        xs   = map (\(x,y) -> x) xys
+        ys   = map (\(x,y) -> y) xys
+        avgX = average xs
+        avgY = average ys
+        sumOfMultipliedXYDiffs = sum $ map (\(x,y) -> (x-avgX)*(y-avgY)) xys
+        sumOfSquaredXDiffs     = sum $ map (\(x,y) -> (x-avgX)*(x-avgX)) xys
+        b = sumOfMultipliedXYDiffs / sumOfSquaredXDiffs
+        a = avgY - b * avgX
+    in
+    if allEqual xs         -- data on a vertical line
+    then (average ys, 0.0) -- return horizontal function
+    else (a, b)
+
+weightHeight = -- from https://online.stat.psu.edu/stat462/node/92/
+    [(63.0, 127.0) ,(64.0, 121.0) ,(66.0, 142.0) ,(69.0, 157.0) ,(69.0, 162.0)
+    ,(71.0, 156.0) ,(71.0, 169.0) ,(72.0, 165.0) ,(73.0, 181.0) ,(75.0, 208.0)
+    ]
+-- End Regression --
+
+main args = do
+    FregeFX.launch $ withResizableStage buildNode
+
+buildNode :: Pane -> Stage -> JFX Node
+buildNode pane stage = do
+    stage.setTitle "FregeFX JavaFxLineChart"
+    sheets <- pane.getStylesheets
+    sheets.add "file:./src/main/frege/fhnw/JavaFxLineChart.css"
+
+    xAxis <- NumberAxis.new "Weight (kg)"    60.0    80.0    5.0
+    yAxis <- NumberAxis.new "Height (cm)"   100.0   210.0   20.0
+    lineChart <- LineChart.new xAxis yAxis
+    lineChart.setTitle "Linear Regression"
+
+    -- add the regression line first such that it is below the data points
+    regSeries <- XYChartSeries.new ()
+    (a, b) = linearRegression weightHeight
+    regSeries.setName $ "f(x)= " ++ show a ++ " + " ++ show b ++ " x"
+    regData = map (\x -> (x, a + b * x)) [60.0, 80.0]
+    for regData $ addXY regSeries
+    lineChart.getData >>= _.add regSeries
+
+    -- add all sample data points
+    xySeries <- XYChartSeries.new ()
+    xySeries.setName "Original Data"
+    for weightHeight $ addXY xySeries
+    lineChart.getData >>= _.add xySeries
+
+    return lineChart
+
+addXY :: XYChartSeries -> (Double, Double) -> JFX ()
+addXY series (x, y) = do
+    doOutside $ println $ "x: " ++ show x ++ ", y: " ++ show y
+    doOutside printThread
+    xyPoint <- XYChartData.new x y
+    series.getData >>= _.add xyPoint
+    return ()
+
+doOutside :: IO () -> JFX ()
+doOutside effect = effect `thenDo` ( \_ -> return () )
+
+-- println ("x: " ++ show x ++ ", y: " ++ show y) `thenDo` ( \_ -> return () )
+
+printThread :: IO ()
+printThread = do
+    thread <- Thread.current()
+    name   <- thread.getName
+    println $ "Current Thread is: " ++ name
+
+
