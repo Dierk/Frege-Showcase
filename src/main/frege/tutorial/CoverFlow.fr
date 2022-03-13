@@ -1,0 +1,174 @@
+
+module tutorial.CoverFlow where
+
+import fregefx.JavaFxType 
+import fregefx.JavaFxAll hiding (ListView)
+import fregefx.JavaFxUtils
+                 
+imageDirName = "/Users/Shared/flickr/bigger/"    
+urlPrefix    = "file:" ++ imageDirName                       
+totalWidth   = 1024.0
+totalHeight  = 768.0                     
+                                                                                                                                                                                                                                                                                                                                                                                       
+main args = do
+    FregeFX.launch $ withStage buildUI
+            
+readFileNames ∷ IO [String]
+readFileNames = do
+    filenames <- filenamesInDir imageDirName 
+    return $ map (urlPrefix++) $ filter (~´.jpg´) filenames
+    
+position :: ImageView -> (Double -> Double) -> JFX ImageView
+position imageView calcXoffset = do
+    imageWidth  <- widthOf  0.0 imageView
+    imageHeight <- heightOf 0.0 imageView
+    imageView.setTranslateX (calcXoffset imageWidth)              
+    imageView.setTranslateY ((totalHeight - imageHeight) / 3) -- position a bit higher
+    return imageView 
+
+putCenter imageView  = position imageView centerPos 
+centerPos imageWidth = (totalWidth  - imageWidth)  / 2
+        
+putLeft imageView  = position imageView leftPos
+leftPos imageWidth = - imageWidth        
+                        
+putRight imageView  = position imageView rightPos 
+rightPos imageWidth = totalWidth       
+                                                
+buildUI :: Group -> Stage -> JFX Group
+buildUI root stage = do
+    stage.setTitle "FregeFX Cover Flow"
+    stage.setWidth  totalWidth
+    stage.setHeight totalHeight    
+  
+    pane <- Pane.new () :: JFX Pane
+    root <: do                
+        pane `addNode` do
+            r <- Rectangle.new 0.0 0.0 totalWidth totalHeight
+            r.setStyle "-fx-fill:radial-gradient(center 25% 25%, radius 60%, reflect, red, black );"
+            return r       
+                       
+    scene <- stage.getScene     
+    readFileNames `thenDo` (onImagesLoaded scene pane)
+    
+    return root         
+    
+onImagesLoaded :: Scene -> Pane -> [String] -> JFX ()    
+onImagesLoaded scene pane urls = do    
+    -- create views
+    focusRing = fromList $ map Image.new urls 
+    centerImageView <- ImageView.new =<< getFocus focusRing
+    leftImageView   <- ImageView.new =<< getFocus (focusLeft focusRing)
+    rightImageView  <- ImageView.new =<< getFocus (focusRight focusRing)
+    -- layout
+    reflect <- Reflection.new () :: JFX Reflection 
+    reflect.setTopOffset 30
+    reflect.setTopOpacity 0.5
+    pane `addNode` do
+        leftImageView.setEffect reflect
+        putLeft leftImageView 
+    pane `addNode` do
+        centerImageView.setEffect reflect
+        putCenter centerImageView 
+    pane `addNode` do
+        rightImageView.setEffect reflect
+        putRight rightImageView  
+    -- binding           
+    viewTripleRef <- JFXRef.new (leftImageView, centerImageView, rightImageView)                    
+    focusRingRef  <- JFXRef.new focusRing           
+    keyReleasedHandler <- onKeyReleased viewTripleRef focusRingRef     
+    scene.setOnKeyReleased  keyReleasedHandler      
+
+viewTransition :: ImageView -> Double -> Double -> JFX ()
+viewTransition sourceView targetX scale = do
+    duration <- Duration.new 500.0
+    trans <- TranslateTransition.new duration sourceView 
+    trans.setToX targetX
+    trans.playFromStart
+    scaling <- ScaleTransition.new duration sourceView  
+    scaling.setToX scale
+    scaling.setToY scale
+    scaling.playFromStart
+    
+type ViewTriple = (ImageView, ImageView, ImageView)  
+type ImageRing  = FocusRing (JFX Image)
+
+widthOf :: Double -> ImageView -> JFX Double
+widthOf standard imageView =
+    maybe (return standard) Image.getWidth =<< imageView.getImage
+    
+heightOf :: Double -> ImageView -> JFX Double    
+heightOf standard imageView =
+    maybe (return standard) Image.getHeight =<< imageView.getImage
+
+onKeyReleased :: JFXRef ViewTriple -> JFXRef ImageRing -> JFX (EventHandler KeyEvent)
+onKeyReleased viewTripleRef focusRingRef = return (onAction handleKeyEvent) where
+    handleKeyEvent keyEvent = do
+        -- jfxlog . show =<< keyEvent.toString -- enable to inspect key events
+        (left, center, right) <- viewTripleRef.get
+        focusRing <- focusRingRef.get
+        codeName <- keyEvent.getCode >>= _.getName
+        case codeName of
+            "Left"  -> do    
+                newFocusRing = focusLeft focusRing   
+                left.setImage =<< getFocus newFocusRing 
+                focusRingRef.put newFocusRing   
+                rightWidth  <- widthOf 0.0 right
+                centerWidth <- widthOf 0.0 center
+                viewTransition center (rightPos rightWidth)   0.3
+                viewTransition left   (centerPos centerWidth) 1.0
+                putLeft right 
+                viewTripleRef.put (right, left, center)
+            "Right" -> do
+                newFocusRing = focusRight focusRing   
+                right.setImage =<< getFocus newFocusRing 
+                focusRingRef.put newFocusRing 
+                leftWidth   <- widthOf 0.0 left 
+                centerWidth <- widthOf 0.0 center    
+                viewTransition center (leftPos leftWidth)     0.3
+                viewTransition right  (centerPos centerWidth) 1.0
+                putRight left 
+                viewTripleRef.put (center, right, left)
+            _ -> jfxlog $ "no handler for key code name '" ++ codeName ++"'"
+
+
+-- implementation details
+
+filenamesInDir :: String -> IO [String]
+filenamesInDir rootDirName  = do
+    dir = File.new rootDirName -- updated to latest frege version 3.25
+    mayList <- dir.list
+    case mayList of
+        Nothing -> return []
+        Just array -> do
+            length <- array.getLength
+            ioFilenameList =
+                let unwrap i = return . unJust =<< array.getAt i
+                in  map unwrap [0..length-1]
+            sequence ioFilenameList
+
+data FocusRing a = FocusRing {
+    --- all values left of the focus in reverse order
+    pre  :: [a],
+    --- first value of this list is considered the focus, the tail is all values right of the focus
+    post :: [a]
+}  
+--- One can create a FocusRing from a list but ftm cannot change the content
+fromList :: [a] -> FocusRing a
+fromList []   = error "FocusRing must not be empty!"
+fromList list = FocusRing [] list
+
+getFocus :: FocusRing a -> a
+getFocus FocusRing{post=p} = head p -- cannot be empty
+
+focusRight :: FocusRing a -> FocusRing a
+-- wrap around
+focusRight (FocusRing pre (f:[]))   = FocusRing [] (reverse (f:pre) )
+focusRight (FocusRing pre (f:rest)) = FocusRing (f:pre) rest
+focusRight (FocusRing pre [])       = error "focus cannot be empty"
+
+
+focusLeft :: FocusRing a -> FocusRing a
+-- wrap around
+focusLeft (FocusRing []      post) = FocusRing (tail reversed) [head reversed] where reversed = reverse post
+focusLeft (FocusRing (p:pre) post) = FocusRing pre (p:post)

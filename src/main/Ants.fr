@@ -1,0 +1,451 @@
+module fhnw.Ants where -- from Volker's frege_thesis
+
+import Control.concurrent.STM
+import Control.Concurrent
+
+import Data.List (nub, sortBy)
+
+import System.Random
+
+import fregefx.JavaFxAll (GraphicsContext, Color, Group, Stage, Canvas, VBox)
+import fregefx.JavaFxUtils (<:, withStage, FregeFX, withUI)
+
+data Location = L { !x :: Int
+                  , !y :: Int
+                  }
+derive Eq Location
+derive Show Location
+
+data Cell = Cell {
+    --- amount of food in the cell; >= 0
+    !food :: Int,
+    --- amount of pheromons in the cell; >= 0
+    !pher :: Int,
+    --- Indicates whether an ant is in the cell and that this cell is its position
+    !ant  :: Maybe Ant,
+    --- indicates whether this cell is in the ant hill
+    !home :: Bool
+    } where
+    takeFood :: Cell -> Cell
+    takeFood cell = cell.{
+        food <- if isJust cell.ant then pred else id, 
+        ant  <- fmap _.{ food = True }
+    }
+
+    dropFood :: Cell -> Cell
+    dropFood cell = cell.{
+        food <- succ,
+        ant  <- fmap _.{ food = False }
+    }
+
+    placeAnt :: Cell -> Ant -> Cell
+    placeAnt cell ant = cell.{ ant = Just ant }
+
+    removeAnt :: Cell -> Cell
+    removeAnt cell = cell.{ ant = Nothing }
+
+    dropPheromone :: Cell -> Cell
+    dropPheromone cell = cell.{ pher <- excite, ant <- fmap calmdown} where     
+        calmdown ant = ant.{excited = min excitement (ant.excited - boost)}
+        excite pher = min pherLimit (pher + 1 + boost)
+        boost = case cell.ant of 
+            Nothing -> error "cannot happen!"
+            Just ant -> if ant.excited >= pherBoost then pherBoost else 0
+        
+derive Show Cell
+
+--- directions from North to North West going clock-wise.
+data Direction = N | NE | E | SE | S | SW | W | NW where   
+    --- clockwise direction change     
+    succ :: Direction -> Direction
+    succ dir = case dir of
+        N  -> NE
+        NE -> E
+        E  -> SE
+        SE -> S
+        S  -> SW
+        SW -> W
+        W  -> NW
+        NW -> N
+    --- counter-clockwise direction change    
+    pred :: Direction -> Direction
+    pred dir = case dir of
+        N  -> NW
+        NE -> N
+        E  -> NE
+        SE -> E
+        S  -> SE
+        SW -> S
+        W  -> SW
+        NW -> W
+
+derive Show Direction
+
+--- Translate a Direction into a pair of x and y offsets.
+deltaDirection :: Direction -> Location
+deltaDirection x = case x of
+    N  -> L   0  (-1)
+    NE -> L   1  (-1)
+    E  -> L   1    0
+    SE -> L   1    1
+    S  -> L   0    1
+    SW -> L (-1)   1
+    W  -> L (-1)   0
+    NW -> L (-1) (-1)
+
+data Ant = Ant { 
+    !direction :: Direction,
+    !food      :: Bool,
+    !excited   :: Int  -- extra pheros to drop; >= 0
+    } where
+    
+    --- turn the ant so often to the right (positive numbers) or to the left (negative)           
+    turn :: Ant -> Int -> Ant
+    turn ant amount 
+        | amount == 0 = ant
+        | amount >  0 = turn ant.{direction <- _.succ } (amount - 1)
+        | otherwise   = turn ant.{direction <- _.pred } (amount + 1)
+
+derive Show Ant
+
+
+data AntAgent = AntAgent { 
+    !world    :: World,
+    !location :: Location,
+    rng       :: TVar StdGen -- random number generator
+    } where
+
+    dice :: AntAgent -> STM Double
+    dice agent = do
+        rng <- agent.rng.read
+        let (result, rng') = Double.random rng
+        agent.rng.write rng'
+        return result
+
+    --- move ant from old into new cell if new cell is empty
+    move :: AntAgent -> STM AntAgent
+    move agent = do
+        let oldp = agent.world.place agent.location
+        oldc <- oldp.read
+        let ant      = unJust oldc.ant
+            newloc   = agent.world.deltaLocation agent.location ant.direction
+            newp     = agent.world.place newloc
+        newc <- newp.read
+        case newc.ant of
+            Just _  -> return agent
+            Nothing -> do
+                if oldc.home
+                    then oldp.write oldc.removeAnt
+                    else oldp.write oldc.dropPheromone.removeAnt
+                newp.write $ newc.placeAnt ant
+                return agent.{ location = newloc }
+
+    behave :: AntAgent -> STM AntAgent
+    behave agent = do
+        let oldp = agent.world.place agent.location
+        cell <- oldp.read
+        let
+            world      = agent.world
+            ant        = unJust cell.ant
+            ahead      = world.place (world.deltaLocation agent.location ant.direction)
+            aheadLeft  = world.place (world.deltaLocation agent.location (ant.direction.pred))
+            aheadRight = world.place (world.deltaLocation agent.location (ant.direction.succ))
+        cellAhead <- ahead.read
+        cellAheadLeft <- aheadLeft.read
+        cellAheadRight <- aheadRight.read
+        let
+            places = [cellAhead, cellAheadLeft, cellAheadRight]
+        if ant.food
+            -- going home?
+            then
+            -- going home
+                -- at home?
+                if cell.home
+                    -- at home
+                    then do
+                        oldp.write $ cell.dropFood.placeAnt (ant.{food=False,excited=excitement}.turn 4)
+                        return agent
+                else 
+                    -- not at home
+                    if cellAhead.home && isNothing cellAhead.ant
+                        then (move agent >>= return) -- examine: why is bind return needed?
+                        else
+                            let
+                                actions :: [STM AntAgent]
+                                actions = [move agent >>= return,
+                                           (oldp.write (cell.placeAnt (ant.turn (-1)))) >> return agent,
+                                           (oldp.write (cell.placeAnt (ant.turn   1 ))) >> return agent]
+                                rankAhead cell = if isJust cell.ant then 0 else cell.pher
+                                rankHome  cell = if cell.home then 2 else 1
+                                ranks = ranked places [
+                                    [rankAhead],
+                                    [rankHome, _.pher],
+                                    [rankHome, _.pher]
+                                    ]
+                            in do
+                                r <- agent.dice
+                                let i = wrand r ranks
+                                actions !! i
+            else
+            -- foraging
+                if cell.food > 0 && !cell.home
+                    -- food in cell and not home?
+                    then do
+                        oldp.write $ cell.takeFood.placeAnt (ant.{food=True,excited=excitement}.turn 4)
+                        return agent
+                    -- no food?
+                    else
+                        if cellAhead.food > 0 && !cellAhead.home && isNothing cellAhead.ant
+                            then (move agent >>= return)
+                            else
+                                let
+                                    actions :: [STM AntAgent]
+                                    actions = [move agent >>= return,
+                                               (oldp.write (cell.placeAnt (ant.turn (-1)))) >> return agent,
+                                               (oldp.write (cell.placeAnt (ant.turn   1 ))) >> return agent]
+                                    rankAhead c = case c.ant of
+                                                    Just _    -> 0
+                                                    otherwise -> c.pher + c.food + (if c.home then 0 else 2)
+                                    ranks = ranked places [[rankAhead],
+                                                           [_.food, _.pher, const 1],
+                                                           [_.food, _.pher, const 1]
+                                                          ]
+                                in do
+                                    r <- agent.dice
+                                    let i = wrand r ranks
+                                    actions !! i
+
+    act :: AntAgent -> IO Bool -> IO ()
+    act agent running = do
+        Thread.sleep antSleep
+        stillRunning <- running
+        if stillRunning
+            then do agent' <- atomically $ agent.behave
+                    act agent' running
+            else return ()
+
+--- for each cell, apply its list of ranking functions
+ranked :: [Cell] -> [[(Cell -> Int)]] -> [Int]
+ranked cs fss = zipWith go cs fss where
+    go c fs = (succ $ sum $ map ($ c) fs)
+
+--- index selection from list of weights, given a (random) "distance" rate
+wrand :: Double -> [Int] -> Int
+wrand rate weights = loop 0 weights 0 where        
+    loop i []     acc = i.pred
+    loop i (x:xs) acc =           -- count weight indexes
+        if distance < (x + acc)   -- until distance has been reached
+            then i
+            else loop i.succ xs (x + acc)
+    total    = sum weights
+    distance = min (max 0 (total - 1)) (rate * total.double).long.fromIntegral
+
+--- The world consists of TVars of type Cell.
+data World = private World { !cells :: [[TVar Cell]]
+                           , !dimX  :: Int
+                           , !dimY  :: Int
+                           } where
+        new :: Int -> Int -> STM World
+        new dimX dimY = do
+            cells <- mapM (const $ mapM (const $ TVar.new (Cell 0 0 Nothing False)) [0..dimY - 1]) [0..dimX - 1]
+            return $ World cells dimX dimY
+
+        place :: World -> Location -> TVar Cell
+        place world (L x y) = (world.cells !! x) !! y
+
+        deltaLocation :: World -> Location -> Direction -> Location
+        deltaLocation world loc dir =
+                case deltaDirection dir of
+                    L dx dy = L ((loc.x + dx + world.dimX) `rem` world.dimX)
+                                ((loc.y + dy + world.dimY) `rem` world.dimY)
+
+        locations :: World -> [Location]
+        locations world = [L x y | x <- [0..world.dimX - 1], y <- [0..world.dimY - 1]]
+
+
+evaporate :: World -> IO ()
+evaporate world = do
+        mapM_ evap $ concat world.cells
+    where
+        evap place = atomically $ do
+            cell <- place.read
+            place.write $ cell.{pher <- \x -> max 0 (x - 1)}
+
+evaporator :: World -> IO ()
+evaporator world = do
+    Thread.sleep evaporationRate
+    evaporate world
+
+createWorld :: Int -> Int -> Int -> Int -> IO (World, [AntAgent])
+createWorld dimX dimY nantsSqrt nfood = do
+        world <- atomically $ World.new dimX dimY
+        -- create food places
+        rng <- getStdGen
+        (prngX, prngY) = rng.split
+        (_, prngFood)  = prngY.split
+        foodLocations = take nfood $ nub $ zipWith L
+                            (Int.randomRs (25, 65 - 1) prngX)
+                            (Int.randomRs (25, 65 - 1) prngY)
+        atomically $ zipWithM_ (setFood world) foodLocations (take nfood $ Int.randomRs foodRange prngFood)
+        -- create home
+        atomically $ mapM_ (setHome world) homeLocations
+        -- create ants and ant agents
+        rng <- getStdGen
+        rngs <- mapM (atomically • TVar.new) $ take nants $ makeRngs rng
+        turns <- sequence $ replicate nants $ Int.randomRIO (0, 7)
+        ants = zipWith Ant.turn (repeat (Ant N False 0)) turns
+        atomically $ zipWithM_ (setAnt world) ants homeLocations
+        agents = zipWith (AntAgent world) homeLocations rngs
+        return (world, agents)
+    where
+        nants         = nantsSqrt * nantsSqrt
+        homeOffsetX   = dimX `div` 4
+        homeOffsetY   = dimY `div` 4
+        homeRangeX    = [homeOffsetX..(homeOffsetX + nantsSqrt - 1)]
+        homeRangeY    = [homeOffsetY..(homeOffsetY + nantsSqrt - 1)]
+        homeLocations = [L x y | x <- homeRangeX, y <- homeRangeY]
+        makeRngs :: StdGen -> [StdGen]
+        makeRngs rng  = x : makeRngs y
+                where (x, y) = rng.split
+        --makeRnds rng = r : makeRnds g
+        --        where (r, g) = Double.random rng
+        setHome world loc = do
+                p = world.place loc
+                c <- p.read
+                p.write $ c.{home = True}
+        setFood world loc amt = do
+                p = world.place loc
+                c <- p.read
+                p.write $ c.{food=amt}
+        setAnt world ant loc = do
+                p = world.place loc
+                c <- p.read
+                p.write $ c.placeAnt ant.{excited=excitement}
+
+drawWorld :: World -> GraphicsContext -> IO ()
+drawWorld world ctx = do
+        colorBg <- Color.white
+        ctx.setFill colorBg
+        ctx.fillRect 0 0 world.dimX.double world.dimY.double
+        cells <- atomically $ mapM TVar.read $ concat world.cells
+        sequence_ $ zipWith drawCell world.locations cells
+        homeColor <- Color.blue
+        ctx.setStroke homeColor
+        ctx.setLineWidth (1.0 / displayScale)
+        ctx.strokeRect homeOffsetX homeOffsetY nantsSqrt.double nantsSqrt.double
+    where
+        homeOffsetX = world.dimX.double / 4
+        homeOffsetY = world.dimY.double / 4
+        drawCell loc (Cell food pher ant home) = do
+                pherColor <- Color.rgb  0  255  0  ((min 1 (pher.double / pherScale))) :: IO Color
+                foodColor <- Color.rgb 255  0   0  ((min 100 food).double / 100) :: IO Color
+                fillCell loc.x loc.y pherColor
+                fillCell loc.x loc.y foodColor
+                case ant of
+                    Just ant -> drawAnt loc.x.double loc.y.double ant
+                    Nothing  -> return ()
+            where
+                fillCell x y c = do
+                        ctx.setFill c
+                        ctx.fillRect x.double y.double 1 1
+                drawAnt x y (Ant dir food _) = do
+                        color <- if food
+                                    then Color.red
+                                    else Color.black
+                        ctx.setStroke color
+                        ctx.setLineWidth (3 / displayScale)
+                        ctx.strokeLine fx fy tx ty
+                    where
+                        fx = x + 0.5 + (lx.double * 0.5)
+                        fy = y + 0.5 + (ly.double * 0.5)
+                        tx = x + 0.5 -- (lx.double * 0.5)
+                        ty = y + 0.5 -- (ly.double * 0.5)
+                        L lx ly = deltaDirection dir
+
+createCanvas :: Double -> IO Canvas
+createCanvas scale = do
+        c <- Canvas.new width height :: IO Canvas
+        ctx <- c.getGraphicsContext2D :: IO GraphicsContext
+        ctx.scale scale scale
+        return c
+
+buildUI :: TMVar (Maybe (GraphicsContext -> IO ())) -> TVar Bool -> Group -> Stage -> IO Group
+buildUI mvar running root stage = do
+        stage.setTitle "Ant Colony"
+        canvas <- createCanvas displayScale
+        ctx <- canvas.getGraphicsContext2D :: IO GraphicsContext
+        forkOS (loop running $ animator mvar ctx)
+        root <: do
+            vbox <- VBox.new 5d :: IO VBox
+            kids <- vbox.getChildren
+            kids.add canvas
+            return vbox
+    where
+        animator :: TMVar (Maybe (GraphicsContext -> IO ())) -> GraphicsContext -> IO ()
+        animator mvar ctx = do
+            mf <- atomically $ takeTMVar mvar
+            case mf of
+                Just f  -> withUI $ f ctx
+                Nothing -> return ()
+
+displayScale = 8.0
+
+dim = 80
+dimX = dim
+dimY = dim
+width  = dimX.double * displayScale
+height = dimY.double * displayScale
+nantsSqrt = 7
+nfood = 35
+foodRange = (30, 100)
+antSleep = 20L
+evaporationRate = 700L
+pherScale = 20.0
+excitement = 50
+pherBoost  = 5
+pherLimit = 40
+
+animate :: TMVar (Maybe (GraphicsContext -> IO ())) -> World -> IO ()
+animate pipe world = do
+        atomically $ putTMVar pipe $ Just $ drawWorld world
+        Thread.sleep 100
+
+loop :: TVar Bool -> IO () -> IO ()
+loop running f = do
+    r <- atomically $ running.read
+    if r
+        then (f >> loop running f)
+        else return ()
+
+reporter :: World -> IO ()
+reporter world = do
+        cells <- atomically $ mapM TVar.read $ concat world.cells
+        let nfood    = (sum (map _.food cells)) + foodAnts
+            foodHome = sum $ map _.food $ filter _.home cells
+            foodWild = nfood - foodHome
+            foodAnts = fromIntegral $ length $ filter _.food ants
+            ants     = map unJust $ filter isJust $ map _.ant cells
+            nants    = fromIntegral $ length $ ants
+            phers    = sum $ map _.pher cells
+        println (
+                "Food: " ++ show nfood ++ " (" ++
+                "home: " ++ show foodHome ++ ", " ++
+                "outside: " ++ show foodWild  ++ ") " ++
+                "Ants: " ++ show nants ++ " (" ++
+                "foraging: " ++ show (nants - foodAnts) ++ ", " ++
+                "carring food: " ++ show foodAnts ++ ") " ++
+                "Pheromones: " ++ show phers
+            )
+
+main = do
+    running <- atomically $ TVar.new True
+    (world, agents) <- createWorld dimX dimY nantsSqrt nfood
+    mvar <- atomically $ newEmptyTMVar
+    forkOS (loop running $ animate mvar world)
+    forkOS (loop running $ evaporator world)
+    forkIO (Thread.sleep 2000 >> mapM_ (\a -> forkOS (a.act $ atomically $ running.read)) agents)
+    forkOS (loop running $ (reporter world >> Thread.sleep 2000))
+    FregeFX.launch $ withStage (buildUI mvar running)
+    atomically $ running.write False
+    atomically $ putTMVar mvar Nothing
+    return ()
